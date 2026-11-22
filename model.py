@@ -11,11 +11,17 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
 
 try:
+    import mamba_ssm.modules.mamba2 as _mamba2_mod
     from mamba_ssm.modules.mamba2 import Mamba2 as _Mamba2Native
     _HAS_MAMBA2 = True
+    _HAS_CAUSAL_CONV1D_FN = getattr(_mamba2_mod, "causal_conv1d_fn", None) is not None
+    _HAS_CAUSAL_CONV1D_VARLEN = getattr(_mamba2_mod, "causal_conv1d_varlen_states", None) is not None
 except ImportError:
+    _mamba2_mod = None
     _Mamba2Native = None
     _HAS_MAMBA2 = False
+    _HAS_CAUSAL_CONV1D_FN = False
+    _HAS_CAUSAL_CONV1D_VARLEN = False
 
 try:
     from mamba_ssm.utils.generation import InferenceParams as _OfficialInferenceParams
@@ -131,16 +137,32 @@ class CausalConv1d(nn.Module):
             out = out + weight[:, 0, j].view(1, D, 1) * tap * m.unsqueeze(1).to(tap.dtype)
         return out.transpose(1, 2)
 
+    def _run_conv_with_cache_seq(self, cat_x, tap_seq, q_seq, T):
+        B, _, D = cat_x.shape
+        k = self.kernel_size
+        xc_t = cat_x.transpose(1, 2)
+        weight = self.conv.weight
+        out = torch.zeros(B, D, T, device=cat_x.device, dtype=cat_x.dtype)
+        for j in range(k):
+            tap = xc_t[:, :, j:j + T]
+            k_seq = tap_seq[:, j:j + T]
+            m = (q_seq == k_seq) & (k_seq >= 0)
+            out = out + weight[:, 0, j].view(1, D, 1) * tap * m.unsqueeze(1).to(tap.dtype)
+        return out.transpose(1, 2)
+
     def forward(self, x, conv_cache=None, seq_idx=None, attention_mask=None,
                 seq_cache=None, return_seq_cache=False):
         B, T, D = x.shape
         k = self.kernel_size
         new_seq_cache = None
+        am_f_out = None
         if conv_cache is None:
             if attention_mask is not None and T > 0:
+                if attention_mask.size(1) < T:
+                    raise ValueError(f"attention_mask length {attention_mask.size(1)} < input length {T}")
                 am_bool = attention_mask[:, :T].bool()
-                am_f = am_bool.unsqueeze(-1).to(x.dtype)
-                x = x * am_f
+                am_f_out = am_bool.unsqueeze(-1).to(x.dtype)
+                x = x * am_f_out
                 residual = x
                 real_pos = am_bool.long().cumsum(dim=1) - 1
                 pos_safe = torch.where(am_bool, real_pos, torch.full_like(real_pos, T))
@@ -154,7 +176,7 @@ class CausalConv1d(nn.Module):
                     xc_pad = F.pad(x_comp.transpose(1, 2), (k - 1, 0))
                     xc_comp = self.conv(xc_pad)[:, :, :T].transpose(1, 2)
                 xc = F.pad(xc_comp, (0, 0, 0, 1)).gather(1, pos_safe.unsqueeze(-1).expand(-1, -1, D))
-                xc = xc * am_f
+                xc = xc * am_f_out
                 if k > 1:
                     lengths = am_bool.long().sum(dim=1)
                     cache_offs = lengths.unsqueeze(1) - (k - 1) + torch.arange(k - 1, device=x.device).unsqueeze(0)
@@ -179,32 +201,84 @@ class CausalConv1d(nn.Module):
             if return_seq_cache and seq_idx is not None:
                 new_seq_cache = self._build_seq_cache_from_real(seq_idx, attention_mask, T)
         else:
-            residual = x
-            cat_x = torch.cat([conv_cache, x], dim=1)
-            if seq_cache is not None and seq_idx is not None:
-                q_seq = seq_idx[:, :T].to(torch.int32)
-                tap_seq = torch.cat([seq_cache.to(torch.int32), q_seq], dim=1)
+            if attention_mask is not None and T > 0:
+                if attention_mask.size(1) < T:
+                    raise ValueError(f"attention_mask length {attention_mask.size(1)} < chunk length {T}")
+                am_cur = attention_mask[:, -T:].bool()
+                am_f_out = am_cur.unsqueeze(-1).to(x.dtype)
+                x = x * am_f_out
+                residual = x
                 if T == 1:
-                    valid_taps = (tap_seq == q_seq) & (tap_seq >= 0)
-                    xc_in = (cat_x * valid_taps.unsqueeze(-1).to(x.dtype)).transpose(1, 2)
-                    xc = self.conv(xc_in)[:, :, -1:].transpose(1, 2)
+                    cat_x = torch.cat([conv_cache, x], dim=1)
+                    if seq_cache is not None and seq_idx is not None:
+                        q_seq = seq_idx[:, :1].to(torch.int32)
+                        tap_seq = torch.cat([seq_cache.to(torch.int32), q_seq], dim=1)
+                        valid_taps = (tap_seq == q_seq) & (tap_seq >= 0)
+                        xc_in = (cat_x * valid_taps.unsqueeze(-1).to(x.dtype)).transpose(1, 2)
+                        xc = self.conv(xc_in)[:, :, -1:].transpose(1, 2)
+                        if return_seq_cache:
+                            new_seq_cand = tap_seq[:, -(k - 1):].detach() if k > 1 else tap_seq[:, :0]
+                            new_seq_cache = torch.where(am_cur, new_seq_cand, seq_cache)
+                    else:
+                        xc = self.conv(cat_x.transpose(1, 2))[:, :, -1:].transpose(1, 2)
+                    xc = xc * am_f_out
+                    if k > 1:
+                        new_cache_cand = cat_x[:, -(k - 1):].detach()
+                        new_cache = torch.where(am_cur.unsqueeze(-1), new_cache_cand, conv_cache)
+                    else:
+                        new_cache = cat_x[:, :0].detach()
                 else:
-                    xc_t = cat_x.transpose(1, 2)
-                    weight = self.conv.weight
-                    out = torch.zeros(B, D, T, device=x.device, dtype=x.dtype)
-                    for j in range(k):
-                        tap = xc_t[:, :, j:j + T]
-                        k_seq = tap_seq[:, j:j + T]
-                        m = (q_seq == k_seq) & (k_seq >= 0)
-                        out = out + weight[:, 0, j].view(1, D, 1) * tap * m.unsqueeze(1).to(tap.dtype)
-                    xc = out.transpose(1, 2)
-                if return_seq_cache:
-                    new_seq_cache = tap_seq[:, -(k - 1):].detach() if k > 1 else tap_seq[:, :0]
+                    real_pos = am_cur.long().cumsum(dim=1) - 1
+                    pos_safe = torch.where(am_cur, real_pos, torch.full_like(real_pos, T))
+                    x_comp = torch.zeros(B, T + 1, D, device=x.device, dtype=x.dtype).scatter(
+                        1, pos_safe.unsqueeze(-1).expand(-1, -1, D), x)[:, :T, :]
+                    cat_comp = torch.cat([conv_cache, x_comp], dim=1)
+                    if seq_cache is not None and seq_idx is not None:
+                        seq_in = seq_idx[:, :T].to(torch.int32)
+                        seq_comp = torch.full((B, T + 1), -1, device=seq_idx.device, dtype=torch.int32).scatter(
+                            1, pos_safe, seq_in)[:, :T]
+                        tap_seq = torch.cat([seq_cache.to(torch.int32), seq_comp], dim=1)
+                        xc_comp = self._run_conv_with_cache_seq(cat_comp, tap_seq, seq_comp, T)
+                        if return_seq_cache:
+                            if k > 1:
+                                lengths = am_cur.long().sum(dim=1)
+                                cache_offs = lengths.unsqueeze(1) + torch.arange(k - 1, device=x.device).unsqueeze(0)
+                                new_seq_cache = tap_seq.gather(1, cache_offs.clamp(min=0, max=k - 2 + T)).detach()
+                            else:
+                                new_seq_cache = tap_seq[:, :0]
+                    else:
+                        xc_comp = self.conv(cat_comp.transpose(1, 2))[:, :, -T:].transpose(1, 2)
+                    xc = F.pad(xc_comp, (0, 0, 0, 1)).gather(1, pos_safe.unsqueeze(-1).expand(-1, -1, D))
+                    xc = xc * am_f_out
+                    if k > 1:
+                        lengths = am_cur.long().sum(dim=1)
+                        cache_offs = lengths.unsqueeze(1) + torch.arange(k - 1, device=x.device).unsqueeze(0)
+                        new_cache = cat_comp.gather(
+                            1, cache_offs.clamp(min=0, max=k - 2 + T).unsqueeze(-1).expand(-1, -1, D)
+                        ).detach()
+                    else:
+                        new_cache = torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
             else:
-                xc = self.conv(cat_x.transpose(1, 2))[:, :, -T:].transpose(1, 2)
-            new_cache = cat_x[:, -(k - 1):].detach() if k > 1 else cat_x[:, :0].detach()
+                residual = x
+                cat_x = torch.cat([conv_cache, x], dim=1)
+                if seq_cache is not None and seq_idx is not None:
+                    q_seq = seq_idx[:, :T].to(torch.int32)
+                    tap_seq = torch.cat([seq_cache.to(torch.int32), q_seq], dim=1)
+                    if T == 1:
+                        valid_taps = (tap_seq == q_seq) & (tap_seq >= 0)
+                        xc_in = (cat_x * valid_taps.unsqueeze(-1).to(x.dtype)).transpose(1, 2)
+                        xc = self.conv(xc_in)[:, :, -1:].transpose(1, 2)
+                    else:
+                        xc = self._run_conv_with_cache_seq(cat_x, tap_seq, q_seq, T)
+                    if return_seq_cache:
+                        new_seq_cache = tap_seq[:, -(k - 1):].detach() if k > 1 else tap_seq[:, :0]
+                else:
+                    xc = self.conv(cat_x.transpose(1, 2))[:, :, -T:].transpose(1, 2)
+                new_cache = cat_x[:, -(k - 1):].detach() if k > 1 else cat_x[:, :0].detach()
         xc = self.proj(xc) * F.silu(self.gate(xc))
         out = self.norm(residual + xc)
+        if am_f_out is not None:
+            out = out * am_f_out
         if return_seq_cache:
             return out, new_cache, new_seq_cache
         return out, new_cache
@@ -312,8 +386,15 @@ class GQAAttention(nn.Module):
         sb = _seq_boundary_mask(seq_idx, T_q, T_kv, past_len, x.device, past_seq_idx=past_seq_idx)
         if sb is not None:
             attn_bool = attn_bool & sb
-        if attention_mask is not None and attention_mask.size(1) == T_kv:
-            attn_bool = attn_bool & attention_mask[:, None, None, :].bool()
+        if attention_mask is not None:
+            if attention_mask.size(1) == T_kv:
+                attn_bool = attn_bool & attention_mask[:, None, None, :].bool()
+            elif past_len > 0 and attention_mask.size(1) == T_q:
+                past_ok = torch.ones(B, past_len, dtype=torch.bool, device=x.device)
+                if past_kv_pos is not None:
+                    past_ok = past_kv_pos >= 0
+                full_am = torch.cat([past_ok, attention_mask[:, :T_q].bool()], dim=1)
+                attn_bool = attn_bool & full_am[:, None, None, :]
         if return_importance:
             has_valid = attn_bool.any(dim=-1, keepdim=True)
             safe_mask = attn_bool.clone()
@@ -328,11 +409,16 @@ class GQAAttention(nn.Module):
                 if q_pos_t is not None:
                     q_mask = q_mask * (q_pos_t >= 0).float()
                 C = (attn_w * q_mask[:, None, :, None]).sum(dim=(1, 2))
+            elif attention_mask is not None and past_len > 0 and attention_mask.size(1) == T_q:
+                q_mask = attention_mask[:, :T_q].float()
+                if q_pos_t is not None:
+                    q_mask = q_mask * (q_pos_t >= 0).float()
+                C = (attn_w * q_mask[:, None, :, None]).sum(dim=(1, 2))
             elif q_pos_t is not None:
                 C = (attn_w * (q_pos_t >= 0).float()[:, None, :, None]).sum(dim=(1, 2))
             else:
                 C = attn_w.sum(dim=(1, 2))
-            if attention_mask is not None:
+            if attention_mask is not None and attention_mask.size(1) >= T_kv:
                 C = C * attention_mask.float()[:, :T_kv]
         else:
             out = _safe_sdpa(q, k_e, v_e, attn_bool)
@@ -778,7 +864,7 @@ class ThoughtGQAAttention(nn.Module):
         cache["full_ids"] = slot_assignment
         cache["full_lens"] = cache["full_mask"].long().sum(-1)
 
-    def _write_token_to_cache(self, cache, blk, offset, k_t, v_t, cur_seq_ids=None):
+    def _write_token_to_cache(self, cache, blk, offset, k_t, v_t, cur_seq_ids=None, write_mask=None):
         B = k_t.shape[0]
         device = k_t.device
         b_all = torch.arange(B, device=device)
@@ -794,6 +880,19 @@ class ThoughtGQAAttention(nn.Module):
             off_b = offset.to(device=device, dtype=torch.long).expand(B)
         else:
             off_b = offset.to(device=device, dtype=torch.long)
+
+        if write_mask is not None:
+            active_w = write_mask.bool()
+            if not active_w.any().item():
+                return
+            b_all = b_all[active_w]
+            blk_b = blk_b[active_w]
+            off_b = off_b[active_w]
+            k_t = k_t[active_w]
+            v_t = v_t[active_w]
+            if cur_seq_ids is not None:
+                cur_seq_ids = cur_seq_ids[active_w]
+        B_w = b_all.numel()
 
         was_valid = cache["blk_mask"][b_all, blk_b, off_b]
         if cur_seq_ids is not None and cache["blk_seq_ids"] is not None:
@@ -811,15 +910,15 @@ class ThoughtGQAAttention(nn.Module):
         old_sum_n = cache["sum_lens"][b_all, blk_b]
         need_add_sum = ~was_valid_sum
         new_sum_n = old_sum_n + need_add_sum.long()
-        safe_new_n = new_sum_n.clamp(min=1).float().view(B, 1, 1)
-        old_n_f = old_sum_n.float().view(B, 1, 1)
+        safe_new_n = new_sum_n.clamp(min=1).float().view(B_w, 1, 1)
+        old_n_f = old_sum_n.float().view(B_w, 1, 1)
         new_k_sum_fp32 = torch.where(
-            need_add_sum.view(B, 1, 1),
+            need_add_sum.view(B_w, 1, 1),
             (cache["k_sum_fp32"][b_all, blk_b] * old_n_f + k_t.float()) / safe_new_n,
             cache["k_sum_fp32"][b_all, blk_b],
         )
         new_v_sum_fp32 = torch.where(
-            need_add_sum.view(B, 1, 1),
+            need_add_sum.view(B_w, 1, 1),
             (cache["v_sum_fp32"][b_all, blk_b] * old_n_f + v_t.float()) / safe_new_n,
             cache["v_sum_fp32"][b_all, blk_b],
         )
@@ -829,7 +928,7 @@ class ThoughtGQAAttention(nn.Module):
         cache["k_sum"][b_all, blk_b] = new_k_sum_fp32.to(cache["k_sum"].dtype)
         cache["v_sum"][b_all, blk_b] = new_v_sum_fp32.to(cache["v_sum"].dtype)
 
-        full_ids = cache["full_ids"]
+        full_ids = cache["full_ids"][b_all]
         match = (full_ids == blk_b.unsqueeze(1))
         has_match = match.any(-1)
         match_slot = match.int().argmax(-1)
@@ -889,8 +988,8 @@ class ThoughtGQAAttention(nn.Module):
         valid_all = torch.cat([full_valid.reshape(B, -1), need_sum], dim=1)
         return k_all, v_all, pos_all, valid_all
 
-    def forward_decode(self, x, cache, selected=None, advanced=None, reeval=False,
-                       cur_seq_ids=None, reeval_mask=None):
+    def _decode_chunk_impl(self, x, cache, selected=None, advanced=None, reeval=False,
+                           cur_seq_ids=None, reeval_mask=None, chunk_mask=None):
         B, T_new, D = x.shape
         device = x.device
         past_len = cache["seq_len"]
@@ -898,7 +997,22 @@ class ThoughtGQAAttention(nn.Module):
             "row_seq_lens",
             torch.full((B,), past_len, device=device, dtype=torch.long),
         )
-        end_blk_max = int(((row_seq_lens_before + T_new - 1) // self.block_size).max().item())
+        if chunk_mask is not None:
+            valid_chunk = chunk_mask[:, :T_new].bool()
+            tok_counts = valid_chunk.long().sum(dim=1)
+            pos_mat = torch.where(
+                valid_chunk,
+                row_seq_lens_before.unsqueeze(1) + valid_chunk.long().cumsum(dim=1) - 1,
+                torch.full((B, T_new), -1, device=device, dtype=torch.long),
+            )
+            max_new_pos = int(pos_mat.max().item())
+            end_blk_max = max(max_new_pos, 0) // self.block_size
+        else:
+            valid_chunk = None
+            tok_counts = torch.full((B,), T_new, device=device, dtype=torch.long)
+            pos_mat = row_seq_lens_before.unsqueeze(1) + torch.arange(T_new, device=device).unsqueeze(0)
+            end_blk_max = int((pos_mat.max().item())) // self.block_size if B > 0 and T_new > 0 else 0
+
         needed_nb = end_blk_max + 1
         if selected is not None:
             needed_nb = max(needed_nb, selected.shape[1])
@@ -926,23 +1040,36 @@ class ThoughtGQAAttention(nn.Module):
                 cache["selected"][reeval_rows, S:] = False
                 cache["advanced"][reeval_rows, S:] = False
             for t in range(T_new):
-                cache["selected"][b_all, (row_seq_lens_before + t) // self.block_size] = True
+                if valid_chunk is None:
+                    cache["selected"][b_all, pos_mat[:, t] // self.block_size] = True
+                else:
+                    vt = valid_chunk[:, t]
+                    if vt.any():
+                        cache["selected"][b_all[vt], pos_mat[vt, t] // self.block_size] = True
             self._reeval_slots(cache, reeval_mask=reeval_rows)
         else:
             for t in range(T_new):
-                cache["selected"][b_all, (row_seq_lens_before + t) // self.block_size] = True
+                if valid_chunk is None:
+                    cache["selected"][b_all, pos_mat[:, t] // self.block_size] = True
+                else:
+                    vt = valid_chunk[:, t]
+                    if vt.any():
+                        cache["selected"][b_all[vt], pos_mat[vt, t] // self.block_size] = True
 
         q = self.q_proj(x).view(B, T_new, self.num_heads, self.head_dim).transpose(1, 2)
         k_new = self.k_proj(x).view(B, T_new, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v_new = self.v_proj(x).view(B, T_new, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         for t in range(T_new):
-            pos_b = row_seq_lens_before + t
+            pos_b = pos_mat[:, t].clamp(min=0)
             blk_b = pos_b // self.block_size
             off_b = pos_b % self.block_size
-            self._write_token_to_cache(cache, blk_b, off_b, k_new[:, :, t, :], v_new[:, :, t, :], cur_seq_ids=cur_seq_ids)
+            wm = valid_chunk[:, t] if valid_chunk is not None else None
+            self._write_token_to_cache(
+                cache, blk_b, off_b, k_new[:, :, t, :], v_new[:, :, t, :],
+                cur_seq_ids=cur_seq_ids, write_mask=wm)
 
-        cache["row_seq_lens"] = row_seq_lens_before + T_new
+        cache["row_seq_lens"] = row_seq_lens_before + tok_counts
         cache["seq_len"] = past_len + T_new
 
         k_all, v_all, pos_all, valid_all = self._gather_decode_kv(cache, cur_seq_ids=cur_seq_ids)
@@ -950,19 +1077,47 @@ class ThoughtGQAAttention(nn.Module):
         v_all = v_all.permute(0, 2, 1, 3).contiguous()
         k_e, v_e = self._expand_kv(k_all, v_all, B)
 
-        q_mean = q.mean(dim=2)
+        if valid_chunk is not None:
+            vc_f = valid_chunk.float()
+            q_mean = (q.float() * vc_f[:, None, :, None]).sum(dim=2) / vc_f.sum(dim=1).clamp(min=1.0)[:, None, None]
+        else:
+            q_mean = q.mean(dim=2)
         head_ok = self._build_head_mask(q_mean, cache["k_sum"], cache["selected"], cache["advanced"])
 
         pos_blk = (pos_all // self.block_size).clamp(0, NB - 1)
         head_ok_pos = head_ok.gather(2, pos_blk.unsqueeze(1).expand(-1, self.num_heads, -1))
 
-        q_pos = row_seq_lens_before.unsqueeze(1) + torch.arange(T_new, device=device).unsqueeze(0)
-        causal = q_pos.view(B, 1, T_new, 1) >= pos_all.view(B, 1, 1, -1)
+        causal = (pos_mat.view(B, 1, T_new, 1) >= 0) & (pos_mat.view(B, 1, T_new, 1) >= pos_all.view(B, 1, 1, -1))
         mask = causal & valid_all.view(B, 1, 1, -1) & head_ok_pos.view(B, self.num_heads, 1, -1)
 
         out = _safe_sdpa(q, k_e, v_e, mask)
         out = out.transpose(1, 2).contiguous().view(B, T_new, self.num_heads * self.head_dim)
-        return self.out_proj(out), cache
+        out = self.out_proj(out)
+        if valid_chunk is not None:
+            out = out * valid_chunk.unsqueeze(-1).to(out.dtype)
+        return out, cache
+
+    def forward_decode(self, x, cache, selected=None, advanced=None, reeval=False,
+                       cur_seq_ids=None, reeval_mask=None, chunk_mask=None):
+        T_new = x.shape[1]
+        if T_new <= self.block_size:
+            return self._decode_chunk_impl(
+                x, cache, selected=selected, advanced=advanced, reeval=reeval,
+                cur_seq_ids=cur_seq_ids, reeval_mask=reeval_mask, chunk_mask=chunk_mask)
+        outs = []
+        for s in range(0, T_new, self.block_size):
+            e = min(s + self.block_size, T_new)
+            cm_s = chunk_mask[:, s:e] if chunk_mask is not None else None
+            out_s, cache = self._decode_chunk_impl(
+                x[:, s:e, :], cache,
+                selected=selected if s == 0 else None,
+                advanced=advanced if s == 0 else None,
+                reeval=reeval if s == 0 else False,
+                cur_seq_ids=cur_seq_ids,
+                reeval_mask=reeval_mask if s == 0 else None,
+                chunk_mask=cm_s)
+            outs.append(out_s)
+        return torch.cat(outs, dim=1), cache
 
 
 class Mamba2Layer(nn.Module):
@@ -984,6 +1139,12 @@ class Mamba2Layer(nn.Module):
         except TypeError:
             self.mamba = _Mamba2Native(d_model=d_model, d_state=d_state,
                                         d_conv=d_conv, expand=expand, headdim=headdim)
+
+    def _can_use_seq_idx(self):
+        return _HAS_CAUSAL_CONV1D_FN and getattr(self.mamba, "activation", "silu") in ("silu", "swish")
+
+    def _can_use_varlen(self):
+        return _HAS_CAUSAL_CONV1D_VARLEN and self._can_use_seq_idx()
 
     def _ensure_cache(self, inference_params, batch_size, x_dtype):
         layer_idx = getattr(self.mamba, "layer_idx", None)
@@ -1023,6 +1184,33 @@ class Mamba2Layer(nn.Module):
         if hasattr(self.mamba, "in_proj"):
             return self.mamba.in_proj.weight.dtype
         return x.dtype
+
+    def _step_single_token(self, x_1, inference_params, valid_mask=None):
+        layer_idx = getattr(self.mamba, "layer_idx", None)
+        if valid_mask is not None and not valid_mask.any().item():
+            return torch.zeros_like(x_1)
+        if layer_idx is not None and layer_idx in inference_params.key_value_memory_dict:
+            conv_state, ssm_state = inference_params.key_value_memory_dict[layer_idx]
+            need_restore = (valid_mask is not None) and (not valid_mask.all().item())
+            if need_restore:
+                conv_prev = conv_state.clone()
+                ssm_prev = ssm_state.clone()
+            expected_dt = self._expected_step_conv_dtype(x_1)
+            if conv_state.dtype != expected_dt:
+                conv_tmp = conv_state.to(expected_dt)
+                inference_params.key_value_memory_dict[layer_idx] = (conv_tmp, ssm_state)
+                out = self.mamba(x_1, inference_params=inference_params)
+                conv_state.copy_(conv_tmp.to(conv_state.dtype))
+                inference_params.key_value_memory_dict[layer_idx] = (conv_state, ssm_state)
+            else:
+                out = self.mamba(x_1, inference_params=inference_params)
+            if need_restore:
+                inv = ~valid_mask
+                conv_state[inv] = conv_prev[inv]
+                ssm_state[inv] = ssm_prev[inv]
+                out = out * valid_mask.view(x_1.shape[0], 1, 1).to(out.dtype)
+            return out
+        return self.mamba(x_1, inference_params=inference_params)
 
     def _mask_conv_state_seq_boundary(self, inference_params, seq_idx, attention_mask, T):
         layer_idx = getattr(self.mamba, "layer_idx", None)
@@ -1068,7 +1256,100 @@ class Mamba2Layer(nn.Module):
         out[1:] = torch.cumsum(boundary.to(torch.int32), dim=0)
         return out.unsqueeze(0).contiguous()
 
+    @staticmethod
+    def _iter_contiguous_seq_spans(seq_1d):
+        vals = seq_1d.tolist()
+        spans = []
+        n = len(vals)
+        i = 0
+        while i < n:
+            v = vals[i]
+            if v < 0:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and vals[j] == v:
+                j += 1
+            spans.append((i, j))
+            i = j
+        return spans
+
+    def _run_sequence_split_prefill(self, x, valid, lengths, inference_params, seq_idx):
+        B = x.shape[0]
+        layer_idx = getattr(self.mamba, "layer_idx", None)
+        self._ensure_cache(inference_params, B, x.dtype)
+        out = torch.zeros_like(x)
+        has_cache = (layer_idx is not None) and (layer_idx in inference_params.key_value_memory_dict)
+        for b in range(B):
+            L_b = int(lengths[b].item())
+            if L_b <= 0:
+                continue
+            x_b = x[b:b + 1, valid[b], :]
+            if seq_idx is not None:
+                s_b = seq_idx[b, valid[b]].to(torch.int32)
+                spans = self._iter_contiguous_seq_spans(s_b)
+            else:
+                spans = [(0, L_b)]
+            if not spans:
+                continue
+            y_b = torch.zeros_like(x_b)
+            last_idx = len(spans) - 1
+            for idx, (st, ed) in enumerate(spans):
+                x_seg = x_b[:, st:ed, :]
+                if idx < last_idx:
+                    y_seg = self.mamba(x_seg)
+                else:
+                    sub_inf = _create_inference_params(
+                        max_seqlen=max(getattr(inference_params, "max_seqlen", ed - st), ed - st),
+                        max_batch_size=1,
+                        num_heads=getattr(self.mamba, "nheads", 1),
+                        head_dim=getattr(self.mamba, "headdim", 64),
+                        n_layer=1,
+                    )
+                    sub_inf.seqlen_offset = 0
+                    if has_cache:
+                        orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
+                        sub_conv = torch.zeros(
+                            1, orig_conv.shape[2], orig_conv.shape[1],
+                            device=orig_conv.device, dtype=orig_conv.dtype,
+                        ).transpose(1, 2)
+                        sub_ssm = torch.zeros_like(orig_ssm[b:b + 1])
+                        sub_inf.key_value_memory_dict[layer_idx] = (sub_conv, sub_ssm)
+                    y_seg = self.mamba(x_seg, inference_params=sub_inf)
+                    if has_cache and layer_idx in sub_inf.key_value_memory_dict:
+                        orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
+                        sub_conv, sub_ssm = sub_inf.key_value_memory_dict[layer_idx]
+                        orig_conv[b:b + 1].copy_(sub_conv)
+                        orig_ssm[b:b + 1].copy_(sub_ssm)
+                y_b[:, st:ed, :] = y_seg
+            out[b:b + 1, valid[b], :] = y_b
+        return out
+
+    def _run_sequence_split_training(self, x_seq, seq_arr):
+        B, T, D = x_seq.shape
+        row_outs = []
+        for b in range(B):
+            spans = self._iter_contiguous_seq_spans(seq_arr[b])
+            if not spans:
+                row_outs.append(torch.zeros_like(x_seq[b:b + 1]))
+            elif len(spans) == 1 and spans[0] == (0, T):
+                row_outs.append(self.mamba(x_seq[b:b + 1]))
+            else:
+                chunks = []
+                cur = 0
+                for st, ed in spans:
+                    if st > cur:
+                        chunks.append(torch.zeros(1, st - cur, D, device=x_seq.device, dtype=x_seq.dtype))
+                    chunks.append(self.mamba(x_seq[b:b + 1, st:ed, :]))
+                    cur = ed
+                if cur < T:
+                    chunks.append(torch.zeros(1, T - cur, D, device=x_seq.device, dtype=x_seq.dtype))
+                row_outs.append(torch.cat(chunks, dim=1))
+        return torch.cat(row_outs, dim=0)
+
     def _run_per_sample_prefill(self, x, valid, lengths, inference_params, seq_idx):
+        if seq_idx is not None and not self._can_use_seq_idx():
+            return self._run_sequence_split_prefill(x, valid, lengths, inference_params, seq_idx)
         B = x.shape[0]
         layer_idx = getattr(self.mamba, "layer_idx", None)
         self._ensure_cache(inference_params, B, x.dtype)
@@ -1096,7 +1377,10 @@ class Mamba2Layer(nn.Module):
                 ).transpose(1, 2)
                 sub_ssm = torch.zeros_like(orig_ssm[b:b + 1])
                 sub_inf.key_value_memory_dict[layer_idx] = (sub_conv, sub_ssm)
-            y_b = self.mamba(x_b, inference_params=sub_inf, seq_idx=s_b)
+            try:
+                y_b = self.mamba(x_b, inference_params=sub_inf, seq_idx=s_b)
+            except (TypeError, AssertionError):
+                return self._run_sequence_split_prefill(x, valid, lengths, inference_params, seq_idx)
             out[b:b + 1, valid[b], :] = y_b
             if has_cache and layer_idx in sub_inf.key_value_memory_dict:
                 orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
@@ -1140,8 +1424,7 @@ class Mamba2Layer(nn.Module):
                             sub_conv = orig_conv[nz].clone()
                             sub_ssm = orig_ssm[nz].clone()
                             sub_inf.key_value_memory_dict[layer_idx] = (sub_conv, sub_ssm)
-                        seq_idx_nz = seq_idx[nz].to(torch.int32).contiguous() if seq_idx is not None else None
-                        out_nz = self.mamba(x[nz], inference_params=sub_inf, seq_idx=seq_idx_nz)
+                        out_nz = self.mamba(x[nz], inference_params=sub_inf, seq_idx=None)
                         if layer_idx is not None and layer_idx in inference_params.key_value_memory_dict:
                             orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
                             sub_conv, sub_ssm = sub_inf.key_value_memory_dict[layer_idx]
@@ -1152,72 +1435,76 @@ class Mamba2Layer(nn.Module):
                         self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
                         return out
                     if (lengths > 0).all().item():
-                        x_flat = x[valid].unsqueeze(0)
-                        cu = torch.cat([
-                            torch.zeros(1, device=x.device, dtype=torch.int32),
-                            torch.cumsum(lengths, dim=0).to(torch.int32),
-                        ])
-                        seq_idx_flat = self._build_flat_seq_idx(valid, lengths, seq_idx, x.device)
-                        try:
-                            out_flat = self.mamba(
-                                x_flat,
-                                inference_params=inference_params,
-                                cu_seqlens=cu,
-                                seq_idx=seq_idx_flat,
-                            )
-                            out = torch.zeros_like(x)
-                            out[valid] = out_flat.squeeze(0)
-                            self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
-                            return out
-                        except (TypeError, AssertionError):
-                            out = self._run_per_sample_prefill(x, valid, lengths, inference_params, seq_idx)
-                            self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
-                            return out
+                        if self._can_use_varlen():
+                            x_flat = x[valid].unsqueeze(0)
+                            cu = torch.cat([
+                                torch.zeros(1, device=x.device, dtype=torch.int32),
+                                torch.cumsum(lengths, dim=0).to(torch.int32),
+                            ])
+                            seq_idx_flat = self._build_flat_seq_idx(valid, lengths, seq_idx, x.device)
+                            try:
+                                out_flat = self.mamba(
+                                    x_flat,
+                                    inference_params=inference_params,
+                                    cu_seqlens=cu,
+                                    seq_idx=seq_idx_flat,
+                                )
+                                out = torch.zeros_like(x)
+                                out[valid] = out_flat.squeeze(0)
+                                self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
+                                return out
+                            except (TypeError, AssertionError):
+                                pass
+                        out = self._run_per_sample_prefill(x, valid, lengths, inference_params, seq_idx)
+                        self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
+                        return out
                     else:
-                        nz = (lengths > 0).nonzero(as_tuple=True)[0]
-                        nz_lengths = lengths[nz]
-                        nz_valid = valid[nz]
-                        x_flat = x[nz][nz_valid].unsqueeze(0)
-                        cu = torch.cat([
-                            torch.zeros(1, device=x.device, dtype=torch.int32),
-                            torch.cumsum(nz_lengths, dim=0).to(torch.int32),
-                        ])
-                        seq_idx_nz = seq_idx[nz] if seq_idx is not None else None
-                        seq_idx_flat = self._build_flat_seq_idx(nz_valid, nz_lengths, seq_idx_nz, x.device)
-                        layer_idx = getattr(self.mamba, "layer_idx", None)
-                        sub_inf = _create_inference_params(
-                            max_seqlen=getattr(inference_params, "max_seqlen", T),
-                            max_batch_size=int(nz.numel()),
-                            num_heads=getattr(self.mamba, "nheads", 1),
-                            head_dim=getattr(self.mamba, "headdim", 64),
-                            n_layer=1,
-                        )
-                        sub_inf.seqlen_offset = 0
-                        if layer_idx is not None and layer_idx in inference_params.key_value_memory_dict:
-                            orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
-                            sub_conv = orig_conv[nz].clone()
-                            sub_ssm = orig_ssm[nz].clone()
-                            sub_inf.key_value_memory_dict[layer_idx] = (sub_conv, sub_ssm)
-                        try:
-                            out_flat = self.mamba(
-                                x_flat,
-                                inference_params=sub_inf,
-                                cu_seqlens=cu,
-                                seq_idx=seq_idx_flat,
+                        if self._can_use_varlen():
+                            nz = (lengths > 0).nonzero(as_tuple=True)[0]
+                            nz_lengths = lengths[nz]
+                            nz_valid = valid[nz]
+                            x_flat = x[nz][nz_valid].unsqueeze(0)
+                            cu = torch.cat([
+                                torch.zeros(1, device=x.device, dtype=torch.int32),
+                                torch.cumsum(nz_lengths, dim=0).to(torch.int32),
+                            ])
+                            seq_idx_nz = seq_idx[nz] if seq_idx is not None else None
+                            seq_idx_flat = self._build_flat_seq_idx(nz_valid, nz_lengths, seq_idx_nz, x.device)
+                            layer_idx = getattr(self.mamba, "layer_idx", None)
+                            sub_inf = _create_inference_params(
+                                max_seqlen=getattr(inference_params, "max_seqlen", T),
+                                max_batch_size=int(nz.numel()),
+                                num_heads=getattr(self.mamba, "nheads", 1),
+                                head_dim=getattr(self.mamba, "headdim", 64),
+                                n_layer=1,
                             )
+                            sub_inf.seqlen_offset = 0
                             if layer_idx is not None and layer_idx in inference_params.key_value_memory_dict:
                                 orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
-                                sub_conv, sub_ssm = sub_inf.key_value_memory_dict[layer_idx]
-                                orig_conv[nz] = sub_conv
-                                orig_ssm[nz] = sub_ssm
-                            out = torch.zeros_like(x)
-                            out[valid] = out_flat.squeeze(0)
-                            self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
-                            return out
-                        except (TypeError, AssertionError):
-                            out = self._run_per_sample_prefill(x, valid, lengths, inference_params, seq_idx)
-                            self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
-                            return out
+                                sub_conv = orig_conv[nz].clone()
+                                sub_ssm = orig_ssm[nz].clone()
+                                sub_inf.key_value_memory_dict[layer_idx] = (sub_conv, sub_ssm)
+                            try:
+                                out_flat = self.mamba(
+                                    x_flat,
+                                    inference_params=sub_inf,
+                                    cu_seqlens=cu,
+                                    seq_idx=seq_idx_flat,
+                                )
+                                if layer_idx is not None and layer_idx in inference_params.key_value_memory_dict:
+                                    orig_conv, orig_ssm = inference_params.key_value_memory_dict[layer_idx]
+                                    sub_conv, sub_ssm = sub_inf.key_value_memory_dict[layer_idx]
+                                    orig_conv[nz] = sub_conv
+                                    orig_ssm[nz] = sub_ssm
+                                out = torch.zeros_like(x)
+                                out[valid] = out_flat.squeeze(0)
+                                self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
+                                return out
+                            except (TypeError, AssertionError):
+                                pass
+                        out = self._run_per_sample_prefill(x, valid, lengths, inference_params, seq_idx)
+                        self._mask_conv_state_seq_boundary(inference_params, seq_idx, am, T)
+                        return out
 
         if inference_params is None and attention_mask is not None and attention_mask.size(1) >= T and T > 0:
             am_bool = attention_mask[:, :T].bool()
@@ -1230,7 +1517,13 @@ class Mamba2Layer(nn.Module):
             if seq_idx is not None:
                 seq_comp = torch.full((B, T + 1), -1, device=seq_idx.device, dtype=torch.int32).scatter(
                     1, pos_safe, seq_idx[:, :T].to(torch.int32))[:, :T].contiguous()
-                y_comp = self.mamba(x_comp, seq_idx=seq_comp)
+                if self._can_use_seq_idx():
+                    try:
+                        y_comp = self.mamba(x_comp, seq_idx=seq_comp)
+                    except (TypeError, AssertionError):
+                        y_comp = self._run_sequence_split_training(x_comp, seq_comp)
+                else:
+                    y_comp = self._run_sequence_split_training(x_comp, seq_comp)
             else:
                 y_comp = self.mamba(x_comp)
             out = F.pad(y_comp, (0, 0, 0, 1)).gather(1, pos_safe.unsqueeze(-1).expand(-1, -1, D))
@@ -1238,24 +1531,39 @@ class Mamba2Layer(nn.Module):
 
         if inference_params is not None:
             if not is_prefill:
-                layer_idx = getattr(self.mamba, "layer_idx", None)
-                if layer_idx is not None and layer_idx in inference_params.key_value_memory_dict:
-                    conv_state, ssm_state = inference_params.key_value_memory_dict[layer_idx]
-                    expected_dt = self._expected_step_conv_dtype(x)
-                    if conv_state.dtype != expected_dt:
-                        conv_tmp = conv_state.to(expected_dt)
-                        inference_params.key_value_memory_dict[layer_idx] = (conv_tmp, ssm_state)
-                        out = self.mamba(x, inference_params=inference_params)
-                        conv_state.copy_(conv_tmp.to(conv_state.dtype))
-                        inference_params.key_value_memory_dict[layer_idx] = (conv_state, ssm_state)
+                am_cur = attention_mask[:, -T:].bool() if (attention_mask is not None and attention_mask.size(1) >= T) else None
+                if T == 1:
+                    vm = am_cur[:, 0] if am_cur is not None else None
+                    return self._step_single_token(x, inference_params, valid_mask=vm)
+                outs = []
+                for t in range(T):
+                    vm = am_cur[:, t] if am_cur is not None else None
+                    outs.append(self._step_single_token(x[:, t:t + 1, :], inference_params, valid_mask=vm))
+                return torch.cat(outs, dim=1)
+            if seq_idx is not None:
+                if T == 1:
+                    out = self.mamba(x, inference_params=inference_params, seq_idx=None)
+                    self._mask_conv_state_seq_boundary(inference_params, seq_idx, attention_mask, T)
+                    return out
+                if self._can_use_seq_idx():
+                    seq_arg = seq_idx.to(torch.int32).contiguous()
+                    try:
+                        out = self.mamba(x, inference_params=inference_params, seq_idx=seq_arg)
+                        self._mask_conv_state_seq_boundary(inference_params, seq_idx, attention_mask, T)
                         return out
-                return self.mamba(x, inference_params=inference_params)
-            seq_arg = seq_idx.to(torch.int32).contiguous() if seq_idx is not None else None
-            out = self.mamba(x, inference_params=inference_params, seq_idx=seq_arg)
-            self._mask_conv_state_seq_boundary(inference_params, seq_idx, attention_mask, T)
-            return out
+                    except (TypeError, AssertionError):
+                        pass
+                valid_all = torch.ones(B, T, dtype=torch.bool, device=x.device)
+                lengths_all = torch.full((B,), T, dtype=torch.long, device=x.device)
+                return self._run_sequence_split_prefill(x, valid_all, lengths_all, inference_params, seq_idx)
+            return self.mamba(x, inference_params=inference_params)
         if seq_idx is not None:
-            return self.mamba(x, seq_idx=seq_idx.to(torch.int32).contiguous())
+            if self._can_use_seq_idx():
+                try:
+                    return self.mamba(x, seq_idx=seq_idx.to(torch.int32).contiguous())
+                except (TypeError, AssertionError):
+                    pass
+            return self._run_sequence_split_training(x, seq_idx[:, :T].to(torch.int32))
         return self.mamba(x)
 
 
@@ -1592,7 +1900,7 @@ class HyperConnection(nn.Module):
             nn.Linear(hidden_router, 1),
         )
 
-    def forward(self, streams, layer_fn):
+    def forward(self, streams, layer_fn, attention_mask=None, seq_idx=None, num_seqs=None):
         n = self.num_streams
         w = F.softmax(self.stream_weights, dim=0)
         stacked = torch.stack(streams, dim=1)
@@ -1602,13 +1910,76 @@ class HyperConnection(nn.Module):
         w_streams = (stacked * w_cast.view(1, n, 1, 1)).permute(1, 0, 2, 3).reshape(n, B * T, D)
         x_in = torch.bmm(w_streams, W_in.transpose(-1, -2)).sum(dim=0).view(B, T, D)
         x_out = layer_fn(x_in)
-        x_out_e = x_out.unsqueeze(1).expand(-1, n, -1, -1)
-        combined = torch.cat([stacked, x_out_e], dim=-1)
-        scores = self.router(combined).mean(dim=(2, 3))
+        if (isinstance(self.router, nn.Sequential) and len(self.router) == 3
+                and isinstance(self.router[0], nn.Linear) and isinstance(self.router[2], nn.Linear)):
+            r0 = self.router[0]
+            r2 = self.router[2]
+            dt = stacked.dtype
+            W1_s = r0.weight[:, :D].to(dt)
+            W1_x = r0.weight[:, D:].to(dt)
+            b1 = r0.bias.to(dt) if r0.bias is not None else None
+            h_s = F.linear(stacked, W1_s)
+            h_x = F.linear(x_out.to(dt), W1_x, b1).unsqueeze(1)
+            r_hid = self.router[1](h_s + h_x)
+            r_out = F.linear(r_hid, r2.weight.to(dt), r2.bias.to(dt) if r2.bias is not None else None)
+        else:
+            x_out_e = x_out.unsqueeze(1).expand(-1, n, -1, -1)
+            combined = torch.cat([stacked, x_out_e], dim=-1)
+            r_out = self.router(combined)
+
+        if seq_idx is not None and T > 0:
+            seq_t = seq_idx[:, :T].long()
+            valid_tok = seq_t >= 0
+            if attention_mask is not None:
+                valid_tok = valid_tok & attention_mask[:, :T].bool()
+            if num_seqs is not None:
+                seq_ids_list = list(range(1, int(num_seqs) + 1)) if int(num_seqs) > 1 else []
+            else:
+                uniq = torch.unique(seq_t[valid_tok]) if valid_tok.any() else seq_t.new_empty(0)
+                seq_ids_list = uniq.tolist() if uniq.numel() > 1 else []
+
+            if len(seq_ids_list) > 1:
+                S = len(seq_ids_list)
+                stream_masks = []
+                r_squeezed = r_out.squeeze(-1)
+                for sid in seq_ids_list:
+                    m_s = (seq_t == sid) & valid_tok
+                    m_sf = m_s.to(dtype=r_squeezed.dtype)
+                    denom_s = m_sf.sum(dim=1).clamp(min=1.0).view(B, 1)
+                    sc_s = (r_squeezed * m_sf.unsqueeze(1)).sum(dim=2) / denom_s
+                    tk_s = sc_s.topk(self.top_k, dim=-1).indices
+                    sm_s = torch.zeros(B, n, device=x_out.device, dtype=x_out.dtype)
+                    sm_s.scatter_(1, tk_s, 1.0)
+                    stream_masks.append(sm_s)
+                sm_all = torch.stack(stream_masks, dim=1)
+                if num_seqs is not None and seq_ids_list == list(range(1, S + 1)):
+                    seq_pos_idx = (seq_t - 1).clamp(min=0, max=S - 1)
+                else:
+                    seq_pos_idx = torch.zeros_like(seq_t)
+                    for idx_s, sid in enumerate(seq_ids_list):
+                        seq_pos_idx = torch.where(seq_t == sid, torch.full_like(seq_t, idx_s), seq_pos_idx)
+                tok_stream_mask = sm_all.gather(
+                    1, seq_pos_idx.unsqueeze(-1).expand(-1, -1, n)
+                ).transpose(1, 2)
+                tok_stream_mask = tok_stream_mask * valid_tok.to(dtype=x_out.dtype).unsqueeze(1)
+                W_out = torch.stack([p.weight for p in self.out_proj], dim=0).to(x_out.dtype)
+                deltas_all = torch.matmul(x_out.unsqueeze(1), W_out.unsqueeze(0).transpose(-1, -2))
+                new_stacked = stacked + tok_stream_mask.unsqueeze(-1) * deltas_all
+                return [new_stacked[:, i] for i in range(n)]
+
+        if attention_mask is not None:
+            am = attention_mask[:, :T].to(dtype=r_out.dtype)
+            am_4d = am.view(B, 1, T, 1)
+            denom = am.sum(dim=1).clamp(min=1.0).view(B, 1)
+            scores = (r_out * am_4d).sum(dim=(2, 3)) / denom
+        else:
+            scores = r_out.mean(dim=(2, 3))
         topk_idx = scores.topk(self.top_k, dim=-1).indices
         W_out = torch.stack([p.weight for p in self.out_proj], dim=0).to(x_out.dtype)
         W_sel = W_out[topk_idx]
         deltas_sel = torch.matmul(x_out.unsqueeze(1), W_sel.transpose(-1, -2))
+        if attention_mask is not None:
+            deltas_sel = deltas_sel * attention_mask[:, :T].to(dtype=deltas_sel.dtype).view(B, 1, T, 1)
         new_stacked = stacked.scatter_add(
             1,
             topk_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, T, D),
@@ -1771,7 +2142,8 @@ class ThoughtBlock(nn.Module):
                 attention_mask=None, selected=None, advanced=None, reeval=False,
                 build_cache=False, mamba_inference_params=None,
                 conv_seq_cache=None, cur_seq_ids=None, return_seq_cache=False,
-                real_pos=None, selected_per_seq=None, advanced_per_seq=None, reeval_mask=None):
+                real_pos=None, selected_per_seq=None, advanced_per_seq=None,
+                reeval_mask=None, chunk_mask=None):
         if return_seq_cache:
             x_conv, new_conv, new_conv_seq = self.conv(
                 x, conv_cache, seq_idx=seq_idx, attention_mask=attention_mask,
@@ -1799,7 +2171,8 @@ class ThoughtBlock(nn.Module):
         else:
             x_attn, new_attn_cache = self.attn.forward_decode(
                 x_conv, cache, selected=selected, advanced=advanced,
-                reeval=reeval, cur_seq_ids=cur_seq_ids, reeval_mask=reeval_mask)
+                reeval=reeval, cur_seq_ids=cur_seq_ids,
+                reeval_mask=reeval_mask, chunk_mask=chunk_mask)
         x_up = self.up_proj(x_attn)
 
         x_mamba = self.mamba2(x_up, inference_params=mamba_inference_params,
@@ -1935,6 +2308,28 @@ class CouncilBackbone(nn.Module):
         active = seq_t[torch.arange(B, device=device), last_valid_pos]
         return torch.where(valid_seq.any(dim=1), active, torch.full_like(active, -1))
 
+    def _extract_last_k_tokens(self, input_ids, token_mask, k, prev_last=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+        if k <= 0:
+            return input_ids.new_zeros(B, 0)
+        if prev_last is not None:
+            prev_mask = prev_last >= 0
+            combined_ids = torch.cat([prev_last, input_ids], dim=1)
+            combined_mask = torch.cat([prev_mask, token_mask.bool()], dim=1)
+        else:
+            combined_ids = input_ids
+            combined_mask = token_mask.bool()
+        out = torch.full((B, k), -1, device=device, dtype=input_ids.dtype)
+        lengths = combined_mask.long().sum(dim=1)
+        rank = combined_mask.long().cumsum(dim=1)
+        valid_src = combined_mask & (rank > (lengths.unsqueeze(1) - k))
+        if valid_src.any():
+            b_idx, t_idx = valid_src.nonzero(as_tuple=True)
+            dst_idx = rank[b_idx, t_idx] - lengths[b_idx] + (k - 1)
+            out[b_idx, dst_idx] = combined_ids[b_idx, t_idx]
+        return out
+
     def _compact_importance_and_mask(self, C, kv_pos, num_blocks, seq_vals=None, target_seq=None):
         B = C.shape[0]
         max_len = num_blocks * self.block_size
@@ -1970,14 +2365,19 @@ class CouncilBackbone(nn.Module):
         device = input_ids.device
         is_decode = cache is not None
         want_cache = return_cache and not self.training
+        k_ng = self.engram.max_ngram - 1
 
         seq_idx = None
         active_seq_ids = None
         num_packed_seqs = 0
         if is_decode:
+            if T == 0:
+                raise ValueError("input_ids during decode must have non-zero sequence length")
             active_seq_ids = cache.get("active_seq_ids", None)
             if active_seq_ids is not None:
-                seq_idx = active_seq_ids.view(B, 1)
+                seq_idx = active_seq_ids.view(B, 1).expand(B, T)
+                if attention_mask is not None and attention_mask.size(1) >= T:
+                    seq_idx = torch.where(attention_mask[:, -T:].bool(), seq_idx, torch.full_like(seq_idx, -1))
             attn_seq_idxs = list(cache.get("attn_seq_idxs", [None] * self.num_blocks))
             conv_seq_caches = list(cache.get("conv_seq_caches", [None] * self.num_blocks))
         else:
@@ -1989,23 +2389,63 @@ class CouncilBackbone(nn.Module):
             conv_seq_caches = [None] * self.num_blocks
 
         if is_decode:
-            input_ids_last = input_ids[:, -1:]
-            x = self.embedding(input_ids_last)
-            if "last_tokens" in cache and cache["last_tokens"] is not None:
-                toks = torch.cat([cache["last_tokens"], input_ids_last], dim=1)
-                x = self.engram(x, toks, T_out=x.shape[1], is_decode=True)
+            T_step = T
+            if attention_mask is not None:
+                if attention_mask.size(1) < T_step:
+                    raise ValueError(f"attention_mask length {attention_mask.size(1)} < decode chunk length {T_step}")
+                am_cur = attention_mask[:, -T_step:].bool()
+            else:
+                am_cur = None
+
+            x = self.embedding(input_ids)
+            prev_last_toks = cache.get("last_tokens", None)
+            if prev_last_toks is not None and k_ng > 0:
+                toks = torch.cat([prev_last_toks, input_ids], dim=1)
+                if T_step == 1:
+                    x = self.engram(x, toks, T_out=1, is_decode=True)
+                else:
+                    toks_mask_cur = am_cur if am_cur is not None else torch.ones(B, T_step, dtype=torch.bool, device=device)
+                    toks_mask = torch.cat([prev_last_toks >= 0, toks_mask_cur], dim=1)
+                    if active_seq_ids is not None:
+                        prev_seq = torch.where(prev_last_toks >= 0, active_seq_ids.view(B, 1), torch.full_like(prev_last_toks, -1, dtype=torch.int32))
+                        toks_seq = torch.cat([prev_seq, seq_idx], dim=1)
+                    else:
+                        toks_seq = None
+                    x_padded = F.pad(x, (0, 0, k_ng, 0))
+                    x = self.engram(x_padded, toks, T_out=k_ng + T_step, seq_idx=toks_seq,
+                                    attention_mask=toks_mask, is_decode=False)[:, k_ng:, :]
+            if am_cur is not None:
+                x = x * am_cur.unsqueeze(-1).to(x.dtype)
+            new_last_tokens = self._extract_last_k_tokens(
+                input_ids,
+                am_cur if am_cur is not None else torch.ones(B, T_step, dtype=torch.bool, device=device),
+                k_ng,
+                prev_last=prev_last_toks,
+            )
+
             attn_kvs = list(cache["attn_kvs"])
             conv_caches = list(cache["conv_caches"])
             thought_caches = list(cache["thought_caches"])
             mamba_inf = cache.get("mamba_inference_params", None)
             streams = [x.clone() for _ in range(self.num_streams)]
             past_seq_len = cache.get("seq_len", 0)
-            T_step = x.shape[1]
+            hc_mask = am_cur if am_cur is not None else None
+            hc_seq_idx = None
+            hc_num_seqs = None
             row_seq_lens_before = cache.get(
                 "row_seq_lens",
                 torch.full((B,), past_seq_len, device=device, dtype=torch.long),
             )
-            cur_q_pos = row_seq_lens_before.unsqueeze(1) + torch.arange(T_step, device=device).unsqueeze(0)
+            if am_cur is not None:
+                cur_q_pos = torch.where(
+                    am_cur,
+                    row_seq_lens_before.unsqueeze(1) + am_cur.long().cumsum(dim=1) - 1,
+                    torch.full((B, T_step), -1, device=device, dtype=torch.long),
+                )
+                row_seq_lens_after = row_seq_lens_before + am_cur.long().sum(dim=1)
+            else:
+                cur_q_pos = row_seq_lens_before.unsqueeze(1) + torch.arange(T_step, device=device).unsqueeze(0)
+                row_seq_lens_after = row_seq_lens_before + T_step
             past_kv_pos = cache.get("attn_kv_pos", None)
             if past_kv_pos is None:
                 if past_seq_len > 0:
@@ -2013,12 +2453,26 @@ class CouncilBackbone(nn.Module):
                 else:
                     past_kv_pos = torch.zeros(B, 0, device=device, dtype=torch.long)
             full_kv_pos = torch.cat([past_kv_pos, cur_q_pos], dim=1)
-            row_seq_lens_after = row_seq_lens_before + T_step
             real_pos = None
         else:
             x = self.embedding(input_ids)
             x = self.engram(x, input_ids, seq_idx=seq_idx,
                               attention_mask=attention_mask, is_decode=False)
+            if attention_mask is not None and T > 0:
+                x = x * attention_mask[:, :T].unsqueeze(-1).to(x.dtype)
+            if want_cache:
+                if cu_seqlens is not None and active_seq_ids is not None:
+                    lt_mask = (seq_idx[:, :T] == active_seq_ids.view(B, 1)) & (active_seq_ids.view(B, 1) >= 0)
+                    if attention_mask is not None:
+                        lt_mask = lt_mask & attention_mask[:, :T].bool()
+                elif attention_mask is not None:
+                    lt_mask = attention_mask[:, :T].bool()
+                else:
+                    lt_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+                new_last_tokens = self._extract_last_k_tokens(input_ids, lt_mask, k_ng)
+            else:
+                new_last_tokens = None
+
             attn_kvs = [None] * self.num_blocks
             conv_caches = [None] * self.num_blocks
             thought_caches = [None] * self.num_blocks
@@ -2035,6 +2489,15 @@ class CouncilBackbone(nn.Module):
             streams = [x.clone() for _ in range(self.num_streams)]
             past_seq_len = 0
             T_step = T
+            am_cur = attention_mask[:, :T].bool() if attention_mask is not None else None
+            if attention_mask is not None:
+                hc_mask = attention_mask[:, :T]
+            elif seq_idx is not None:
+                hc_mask = (seq_idx[:, :T] >= 0)
+            else:
+                hc_mask = None
+            hc_seq_idx = seq_idx[:, :T] if (seq_idx is not None and num_packed_seqs > 1) else None
+            hc_num_seqs = num_packed_seqs if num_packed_seqs > 1 else None
             if attention_mask is not None:
                 valid_tok = attention_mask[:, :T].bool()
                 real_pos = torch.where(
@@ -2070,7 +2533,13 @@ class CouncilBackbone(nn.Module):
                         if isinstance(self.blocks[j], GlobalBlock):
                             router_outputs[j] = (ls, la)
             if self.reeval_interval > 0:
-                reeval_rows = (row_seq_lens_before > 0) & ((row_seq_lens_before % self.reeval_interval) == 0)
+                if T_step == 1:
+                    reeval_rows = (row_seq_lens_before > 0) & ((row_seq_lens_before % self.reeval_interval) == 0)
+                else:
+                    reeval_rows = (row_seq_lens_before > 0) & (
+                        ((row_seq_lens_after - 1).clamp(min=0) // self.reeval_interval)
+                        > ((row_seq_lens_before - 1).clamp(min=0) // self.reeval_interval)
+                    )
             else:
                 reeval_rows = torch.zeros(B, dtype=torch.bool, device=device)
             reeval_now = bool(reeval_rows.any().item())
@@ -2081,6 +2550,7 @@ class CouncilBackbone(nn.Module):
 
         router_per_seq = [None] * self.num_blocks
         track_seq_cache = (is_decode or want_cache) and (seq_idx is not None)
+        decode_chunk_mask = am_cur if (is_decode and am_cur is not None) else None
 
         for i in range(self.num_blocks):
             block = self.blocks[i]
@@ -2204,7 +2674,8 @@ class CouncilBackbone(nn.Module):
                                 real_pos=real_pos,
                                 selected_per_seq=sel_ps,
                                 advanced_per_seq=adv_ps,
-                                reeval_mask=reeval_rows)
+                                reeval_mask=reeval_rows,
+                                chunk_mask=decode_chunk_mask)
                         else:
                             h_out, new_attn_cache, new_conv = block(
                                 h, cache=thought_caches[i], conv_cache=conv_caches[i],
@@ -2217,7 +2688,8 @@ class CouncilBackbone(nn.Module):
                                 real_pos=real_pos,
                                 selected_per_seq=sel_ps,
                                 advanced_per_seq=adv_ps,
-                                reeval_mask=reeval_rows)
+                                reeval_mask=reeval_rows,
+                                chunk_mask=decode_chunk_mask)
                             new_conv_seq = None
                         if is_decode or want_cache:
                             conv_caches[i] = new_conv
@@ -2236,7 +2708,8 @@ class CouncilBackbone(nn.Module):
             else:
                 wrapped = layer_fn
 
-            streams = self.hcs[i](streams, wrapped)
+            streams = self.hcs[i](streams, wrapped, attention_mask=hc_mask,
+                                  seq_idx=hc_seq_idx, num_seqs=hc_num_seqs)
 
         w = F.softmax(self.final_mix, dim=0)
         x = sum(w[j] * streams[j] for j in range(self.num_streams))
@@ -2262,6 +2735,7 @@ class CouncilBackbone(nn.Module):
                 "router_routes": router_outputs,
                 "last_sel": last_sel,
                 "last_adv": last_adv,
+                "last_tokens": new_last_tokens,
                 "seq_len": new_seq_len,
                 "row_seq_lens": row_seq_lens_after,
                 "attn_kv_pos": full_kv_pos,
@@ -2423,82 +2897,58 @@ class CouncilModel(nn.Module):
     def generate(self, input_ids, attention_mask=None, max_new_tokens=512,
                  temperature=0.8, eos_token_id=None, repetition_penalty=1.15,
                  no_repeat_ngram_size=0, cu_seqlens=None):
+        was_training = self.training
         self.eval()
-        B = input_ids.size(0)
-        T_p = input_ids.size(1)
-        device = input_ids.device
-        if T_p == 0:
-            raise ValueError("input_ids must have non-zero sequence length")
-        if attention_mask is None:
-            attention_mask = torch.ones(B, T_p, device=device, dtype=torch.long)
-        else:
-            attention_mask = attention_mask.long()
-        am_bool = attention_mask[:, :T_p].bool()
-        if cu_seqlens is not None:
-            seq_idx_p = self.backbone._build_seq_idx_from_cu_seqlens(
-                cu_seqlens, T_p, attention_mask, device, target_batch=B)
-            active_seq_p = self.backbone._extract_active_seq_ids(seq_idx_p, T_p)
-            token_mask_p = am_bool & (seq_idx_p == active_seq_p.view(B, 1)) & (active_seq_p.view(B, 1) >= 0)
-        else:
-            token_mask_p = am_bool
-        if not token_mask_p.any(dim=1).all().item():
-            raise ValueError("Each prompt in generate() must contain at least one non-padding token")
-        if max_new_tokens <= 0:
-            return input_ids
+        try:
+            B = input_ids.size(0)
+            T_p = input_ids.size(1)
+            device = input_ids.device
+            if T_p == 0:
+                raise ValueError("input_ids must have non-zero sequence length")
+            if attention_mask is None:
+                attention_mask = torch.ones(B, T_p, device=device, dtype=torch.long)
+            else:
+                attention_mask = attention_mask.long()
+            am_bool = attention_mask[:, :T_p].bool()
+            if cu_seqlens is not None:
+                seq_idx_p = self.backbone._build_seq_idx_from_cu_seqlens(
+                    cu_seqlens, T_p, attention_mask, device, target_batch=B)
+                active_seq_p = self.backbone._extract_active_seq_ids(seq_idx_p, T_p)
+                token_mask_p = am_bool & (seq_idx_p == active_seq_p.view(B, 1)) & (active_seq_p.view(B, 1) >= 0)
+            else:
+                token_mask_p = am_bool
+            if not token_mask_p.any(dim=1).all().item():
+                raise ValueError("Each prompt in generate() must contain at least one non-padding token")
+            if max_new_tokens <= 0:
+                return input_ids
 
-        k = self.backbone.engram.max_ngram - 1
-        cfg_best_N = getattr(self.config, "best_N", 0)
-        n_rec = cfg_best_N if cfg_best_N > 0 else self.config.rl_generate_recursion
-        force_full = not getattr(self.config, "adaptive_inference", True)
+            k = self.backbone.engram.max_ngram - 1
+            cfg_best_N = getattr(self.config, "best_N", 0)
+            n_rec = cfg_best_N if cfg_best_N > 0 else self.config.rl_generate_recursion
+            force_full = not getattr(self.config, "adaptive_inference", True)
 
-        logits, cache = self.forward(input_ids, attention_mask=attention_mask,
-                                       num_recursion=n_rec, force_full_recursion=force_full,
-                                       cu_seqlens=cu_seqlens, return_cache=True)
+            logits, cache = self.forward(input_ids, attention_mask=attention_mask,
+                                           num_recursion=n_rec, force_full_recursion=force_full,
+                                           cu_seqlens=cu_seqlens, return_cache=True)
 
-        pos_grid = torch.arange(T_p, device=device).unsqueeze(0).expand(B, T_p)
-        masked_pos = torch.where(token_mask_p, pos_grid, torch.full_like(pos_grid, -1))
-        last_pos = masked_pos.max(dim=1).values
-        if k > 0:
-            last_tokens = torch.full((B, k), -1, device=device, dtype=input_ids.dtype)
-            lengths = token_mask_p.long().sum(dim=1)
-            rank = token_mask_p.long().cumsum(dim=1)
-            valid_src = token_mask_p & (rank > (lengths.unsqueeze(1) - k))
-            if valid_src.any():
-                b_idx, t_idx = valid_src.nonzero(as_tuple=True)
-                dst_idx = rank[b_idx, t_idx] - lengths[b_idx] + (k - 1)
-                last_tokens[b_idx, dst_idx] = input_ids[b_idx, t_idx]
-        else:
-            last_tokens = input_ids.new_zeros(B, 0)
-        out = input_ids
-        penalty_mask = token_mask_p.long()
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-        nxt_logits = logits[torch.arange(B, device=device), last_pos, :]
-        nxt_logits = self._apply_repetition_penalty(nxt_logits, out, repetition_penalty, attention_mask=penalty_mask)
-        nxt_logits = self._apply_no_repeat_ngram(nxt_logits, out, no_repeat_ngram_size, attention_mask=penalty_mask)
-        nxt = self._sample_next(nxt_logits, temperature)
-        if eos_token_id is not None:
-            nxt = torch.where(finished.unsqueeze(-1), torch.full_like(nxt, eos_token_id), nxt)
-        out = torch.cat([out, nxt], dim=-1)
-        if eos_token_id is not None:
-            finished = finished | (nxt.squeeze(-1) == eos_token_id)
-            if finished.all().item():
-                return out
-        for _ in range(max_new_tokens - 1):
-            cache["last_tokens"] = last_tokens
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones(B, 1, device=device, dtype=attention_mask.dtype)],
-                dim=1)
-            penalty_mask = torch.cat(
-                [penalty_mask, torch.ones(B, 1, device=device, dtype=penalty_mask.dtype)],
-                dim=1)
-            logits, cache = self.forward(nxt, attention_mask=attention_mask,
-                                           num_recursion=n_rec, cache=cache,
-                                           force_full_recursion=force_full, return_cache=True)
+            pos_grid = torch.arange(T_p, device=device).unsqueeze(0).expand(B, T_p)
+            masked_pos = torch.where(token_mask_p, pos_grid, torch.full_like(pos_grid, -1))
+            last_pos = masked_pos.max(dim=1).values
             if k > 0:
-                last_tokens = torch.cat([last_tokens, nxt], dim=1)[:, -k:]
+                last_tokens = torch.full((B, k), -1, device=device, dtype=input_ids.dtype)
+                lengths = token_mask_p.long().sum(dim=1)
+                rank = token_mask_p.long().cumsum(dim=1)
+                valid_src = token_mask_p & (rank > (lengths.unsqueeze(1) - k))
+                if valid_src.any():
+                    b_idx, t_idx = valid_src.nonzero(as_tuple=True)
+                    dst_idx = rank[b_idx, t_idx] - lengths[b_idx] + (k - 1)
+                    last_tokens[b_idx, dst_idx] = input_ids[b_idx, t_idx]
             else:
                 last_tokens = input_ids.new_zeros(B, 0)
-            nxt_logits = logits[:, -1, :]
+            out = input_ids
+            penalty_mask = token_mask_p.long()
+            finished = torch.zeros(B, dtype=torch.bool, device=device)
+            nxt_logits = logits[torch.arange(B, device=device), last_pos, :]
             nxt_logits = self._apply_repetition_penalty(nxt_logits, out, repetition_penalty, attention_mask=penalty_mask)
             nxt_logits = self._apply_no_repeat_ngram(nxt_logits, out, no_repeat_ngram_size, attention_mask=penalty_mask)
             nxt = self._sample_next(nxt_logits, temperature)
@@ -2508,5 +2958,33 @@ class CouncilModel(nn.Module):
             if eos_token_id is not None:
                 finished = finished | (nxt.squeeze(-1) == eos_token_id)
                 if finished.all().item():
-                    break
-        return out
+                    return out
+            for _ in range(max_new_tokens - 1):
+                cache["last_tokens"] = last_tokens
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones(B, 1, device=device, dtype=attention_mask.dtype)],
+                    dim=1)
+                penalty_mask = torch.cat(
+                    [penalty_mask, torch.ones(B, 1, device=device, dtype=penalty_mask.dtype)],
+                    dim=1)
+                logits, cache = self.forward(nxt, attention_mask=attention_mask,
+                                               num_recursion=n_rec, cache=cache,
+                                               force_full_recursion=force_full, return_cache=True)
+                if k > 0:
+                    last_tokens = torch.cat([last_tokens, nxt], dim=1)[:, -k:]
+                else:
+                    last_tokens = input_ids.new_zeros(B, 0)
+                nxt_logits = logits[:, -1, :]
+                nxt_logits = self._apply_repetition_penalty(nxt_logits, out, repetition_penalty, attention_mask=penalty_mask)
+                nxt_logits = self._apply_no_repeat_ngram(nxt_logits, out, no_repeat_ngram_size, attention_mask=penalty_mask)
+                nxt = self._sample_next(nxt_logits, temperature)
+                if eos_token_id is not None:
+                    nxt = torch.where(finished.unsqueeze(-1), torch.full_like(nxt, eos_token_id), nxt)
+                out = torch.cat([out, nxt], dim=-1)
+                if eos_token_id is not None:
+                    finished = finished | (nxt.squeeze(-1) == eos_token_id)
+                    if finished.all().item():
+                        break
+            return out
+        finally:
+            self.train(was_training)
