@@ -18,9 +18,9 @@ class CouncilConfig:
     engram_table_size: int = 50000
     engram_mem_dim: int = 64
     max_recursion: int = 1
-    max_seq_len: int = 1024
-    pretrain_max_tokens_per_packed_batch: int = 1024
-    sliding_window: int = 1024
+    max_seq_len: int = 512
+    pretrain_max_tokens_per_packed_batch: int = 512
+    sliding_window: int = 512
     fixed_recursion: int = 1
     adaptive_inference: bool = False
 
@@ -34,7 +34,7 @@ class CouncilConfig:
     adv_top_k_b: int = 4
     thought_head_top_k: int = 8
 
-    mamba_d_state: int = 128
+    mamba_d_state: int = 512
     mamba_d_conv: int = 4
     mamba_expand: int = 2
     mamba_headdim: int = 64
@@ -66,15 +66,15 @@ class CouncilConfig:
     attention_checkpoint: bool = True
 
     pretrain_batch_size: int = 8
-    pretrain_grad_accum: int = 5
+    pretrain_grad_accum: int = 3
     pretrain_lr: float = 3e-4
     pretrain_lr_warmdown_steps: int = 50
     pretrain_warmup: int = 500
     pretrain_max_tokens: int = 30_000_000_000_000
     pretrain_max_steps: int = 10_000_000
-    pretrain_save_every_ratio: float = 0.003
+    pretrain_save_every_ratio: float = 0.001
     pretrain_use_packing: bool = False
-    pretrain_beta2: float = 0.9971
+    pretrain_beta2: float = 0.9871
     pretrain_dataset_configs: list = None
     pretrain_num_recursion: int = 1
     pretrain_curriculum_phases: list = None
@@ -129,6 +129,5 @@ def get_config():
             "fineweb-edu",
             "fineweb",
             "dclm-baseline",
-            "dolma",
         ]
     return config
