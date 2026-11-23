@@ -11,7 +11,32 @@ torch._dynamo.config.cache_size_limit = 32
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
 
-_HAS_SDPA_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+def _detect_sdpa_gqa():
+    sdpa = getattr(F, "scaled_dot_product_attention", None)
+    if sdpa is None:
+        return False
+    try:
+        sig = inspect.signature(sdpa)
+        if "enable_gqa" in sig.parameters:
+            return True
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return False
+    except (ValueError, TypeError):
+        pass
+    try:
+        with torch.no_grad():
+            q = torch.zeros((1, 2, 2, 8), device="cpu", dtype=torch.float32)
+            k = torch.zeros((1, 1, 2, 8), device="cpu", dtype=torch.float32)
+            v = torch.zeros((1, 1, 2, 8), device="cpu", dtype=torch.float32)
+            sdpa(q, k, v, is_causal=True, enable_gqa=True)
+        return True
+    except TypeError:
+        return False
+    except Exception:
+        return "enable_gqa" in (getattr(sdpa, "__doc__", None) or "")
+
+
+_HAS_SDPA_GQA = _detect_sdpa_gqa()
 
 try:
     import mamba_ssm.modules.mamba2 as _mamba2_mod
@@ -125,20 +150,18 @@ class CausalConv1d(nn.Module):
                 new_seq_cache[:, (k - 1 - T):] = seq_t.detach()
         return new_seq_cache
 
-def _run_conv_with_seq(self, x_seq, seq_arr, T):
-        B, _, D = x_seq.shape
+    def _run_conv_with_seq(self, x, seq_idx, T):
+        if T == 0:
+            return torch.zeros_like(x)
         k = self.kernel_size
-        xc = F.pad(x_seq.transpose(1, 2), (k - 1, 0))
-        seq_padded = F.pad(seq_arr.long(), (k - 1, 0), value=-1)
-        q_seq = seq_padded[:, k - 1:]
-        weight = self.conv.weight.to(x_seq.dtype)
-        out = torch.zeros(B, D, T, device=x_seq.device, dtype=x_seq.dtype)
-        for j in range(k):
-            tap = xc[:, :, j:j + T]
-            k_seq = seq_padded[:, j:j + T]
-            m = (q_seq == k_seq) & (k_seq >= 0)
-            out = out + weight[:, 0, j].view(1, D, 1) * tap * m.unsqueeze(1).to(tap.dtype)
-        return out.transpose(1, 2)
+        q_seq = seq_idx[:, :T].to(torch.int32)
+        if k <= 1:
+            valid = (q_seq >= 0).unsqueeze(-1).to(x.dtype)
+            xc = self.conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2)
+            return xc * valid
+        x_pad = F.pad(x, (0, 0, k - 1, 0))
+        tap_seq = F.pad(q_seq, (k - 1, 0), value=-1)
+        return self._run_conv_with_cache_seq(x_pad, tap_seq, q_seq, T)
 
     def _run_conv_with_cache_seq(self, cat_x, tap_seq, q_seq, T):
         B, _, D = cat_x.shape
@@ -730,12 +753,12 @@ class ThoughtGQAAttention(nn.Module):
             prev_ff = F.pad(ff_seq[:, :-1], (1, 0), value=-999999)
             is_seq_start = valid_tok & (ff_seq != prev_ff)
             q_prefix_mean = self._segmented_prefix_mean_4d(
-                q.float() * v_f[:, None, :, None], valid_tok, is_seq_start)
+                q.detach().float() * v_f[:, None, :, None], valid_tok, is_seq_start)
         else:
             seq_eff = None
             is_seq_start = torch.zeros(B, T, dtype=torch.bool, device=device)
             is_seq_start[:, 0] = valid_tok[:, 0]
-            q_cs = (q.float() * v_f[:, None, :, None]).cumsum(dim=2)
+            q_cs = (q.detach().float() * v_f[:, None, :, None]).cumsum(dim=2)
             cnt_cs = v_f.cumsum(dim=1).clamp(min=1.0)
             q_prefix_mean = q_cs / cnt_cs[:, None, :, None]
 
@@ -746,7 +769,7 @@ class ThoughtGQAAttention(nn.Module):
         is_blk_start = valid_tok & (ff_blk != prev_ff_blk)
         is_seg_start_k = is_seq_start | is_blk_start
 
-        k_f_seq = k.float() * v_f[:, None, :, None]
+        k_f_seq = k.detach().float() * v_f[:, None, :, None]
         k_bm_self = self._segmented_prefix_mean_4d(k_f_seq, valid_tok, is_seg_start_k)
         if self.num_groups > 1:
             k_self_h = k_bm_self.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, H, T, hd)
@@ -754,7 +777,7 @@ class ThoughtGQAAttention(nn.Module):
             k_self_h = k_bm_self
 
         blk_idx_exp = tok_blk.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, kv_h, hd)
-        k_t_f = k.transpose(1, 2).float()
+        k_t_f = k.detach().transpose(1, 2).float()
 
         if seq_eff is not None:
             uniq_seqs = torch.unique(seq_eff[valid_tok]) if valid_tok.any() else seq_eff.new_empty(0)
@@ -802,7 +825,7 @@ class ThoughtGQAAttention(nn.Module):
             q_pm_c = q_prefix_mean[:, :, qs:qe, :]
 
             if seq_k_bm_list is None:
-                scores_c = torch.einsum('bhqd,bnhd->bhqn', q_pm_c, k_bm_h)
+                scores_c = torch.einsum('bhqd,bnhd->bhqn', q_pm_c, k_bm_h).float()
                 blk_valid_c = valid_blk_global.unsqueeze(1).expand(-1, Qc, -1)
             else:
                 scores_c = torch.zeros(B, H, Qc, NB, device=device, dtype=torch.float32)
@@ -810,13 +833,13 @@ class ThoughtGQAAttention(nn.Module):
                 for s_val, k_bm_sh, vb_s in seq_k_bm_list:
                     qm_s = (seq_eff[:, qs:qe] == s_val) & valid_tok[:, qs:qe]
                     if qm_s.any():
-                        sc_s = torch.einsum('bhqd,bnhd->bhqn', q_pm_c, k_bm_sh)
+                        sc_s = torch.einsum('bhqd,bnhd->bhqn', q_pm_c, k_bm_sh).float()
                         scores_c = torch.where(qm_s[:, None, :, None], sc_s, scores_c)
                         blk_valid_c = torch.where(qm_s[:, :, None], vb_s.unsqueeze(1), blk_valid_c)
 
             diag_score = (q_pm_c * k_self_h[:, :, qs:qe, :]).sum(dim=-1)
             diag_idx = tok_blk[:, qs:qe].unsqueeze(1).unsqueeze(-1).expand(-1, H, -1, -1)
-            scores_c.scatter_(3, diag_idx, diag_score.unsqueeze(-1))
+            scores_c = scores_c.scatter(3, diag_idx, diag_score.unsqueeze(-1).to(scores_c.dtype))
 
             causal_blk_c = (blk_range <= tok_blk[:, qs:qe].unsqueeze(-1)) & valid_tok[:, qs:qe].unsqueeze(-1) & blk_valid_c
             sel_c = sel_eff[:, qs:qe, :] & causal_blk_c
@@ -2344,9 +2367,11 @@ class HyperConnection(nn.Module):
                 if return_router_state:
                     new_router_state = (r_cs[:, :, -1].detach(), cnt_cs[:, -1].detach())
 
-        topk_idx = scores_tok.topk(self.top_k, dim=1).indices
-        tok_stream_mask = torch.zeros(B, n, T, device=x_out.device, dtype=x_out.dtype)
-        tok_stream_mask.scatter_(1, topk_idx, 1.0)
+        topk_vals, topk_idx = scores_tok.topk(self.top_k, dim=1)
+        topk_gates = torch.sigmoid(topk_vals.float()).to(x_out.dtype)
+        tok_stream_mask = torch.zeros(B, n, T, device=x_out.device, dtype=x_out.dtype).scatter(
+            1, topk_idx, topk_gates
+        )
         if valid_tok is not None:
             tok_stream_mask = tok_stream_mask * valid_tok.to(dtype=x_out.dtype).unsqueeze(1)
 
